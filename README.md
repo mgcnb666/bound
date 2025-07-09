@@ -1,209 +1,202 @@
-# 🎲 基于Boundless的猜数字游戏
+# 🎲 Boundless 猜数字游戏完整部署指南
 
-一个使用Boundless证明市场生成随机数的Web游戏。玩家连接MetaMask钱包，系统通过zkVM生成1-100的随机数，玩家猜测比实际数字高或低。
+> 使用 RISC Zero zkVM + Boundless 市场生成可验证随机数，配合 Warp 后端与纯静态前端实现的猜数字小游戏。
 
-## ✨ 功能特点
+---
 
-- 🎯 **纯Web界面** - 无需钱包连接，直接开始游戏
-- 🔐 **零知识证明** - 使用Boundless市场生成可验证的随机数
-- 🎮 **实时游戏** - 动态状态更新和现代UI
-- ⚡ **高性能** - Rust后端 + 原生JavaScript前端
+## 目录
+1. [功能简介](#功能简介)
+2. [整体架构](#整体架构)
+3. [先决条件](#先决条件)
+4. [环境准备](#环境准备)
+5. [编译与运行](#编译与运行)
+6. [域名 & HTTPS 部署](#域名--https-部署)
+7. [常见问题](#常见问题)
+8. [参考链接](#参考链接)
 
-## 🏗️ 技术架构
+---
 
-### zkVM Guest程序 (`guests/random-number/`)
-```rust
-// 使用线性同余生成器产生1-100的随机数
-let seed: u64 = env::read();
-let random = ((seed.wrapping_mul(1103515245).wrapping_add(12345)) % 100) + 1;
-risc0_zkvm::guest::env::commit(&(random as u32));
+## 功能简介
+* 服务器本地生成 **1-100** 的随机数 → 通过 **game-result** guest 在 zkVM 中写入 journal。
+* 后端使用 **Boundless CLI** 将 ELF + 输入上传（Pinata / S3 / 本地）并提交请求。
+* 用户只需浏览器即可游玩（无钱包依赖）。
+
+---
+
+## 整体架构
+```
+┌────────┐    HTTP/JSON     ┌─────────────┐
+│ Browser│ ───────────────► │ Warp Server │
+└────────┘  3030            │  apps/      │
+                             │            │   spawn_cli_proof()
+                             └────┬───────┘
+                                  │ boundless request submit-offer
+                                  ▼
+                           ┌──────────────┐
+                           │ Boundless CLI│ (标准客户端)
+                           └────┬─────────┘
+            上传 ELF+输入          │
+            (Pinata/S3/文件)      ▼
+                           ┌──────────────┐
+                           │ Boundless 网 │ (Prover 网络)
+                           └──────────────┘
 ```
 
-### Web服务器 (`apps/src/main.rs`)
-- 基于Warp框架的REST API
-- Boundless客户端集成
-- 游戏状态管理
+---
 
-### 前端 (`static/index.html`)
-- 纯Web界面，无需钱包
-- 实时状态轮询
-- 现代渐变UI设计
+## 先决条件
+| 组件 | 版本 | 说明 |
+|------|------|------|
+| Rust & Cargo | 1.76+ | 主机 & guest 编译 |
+| RISC Zero 工具链 | 2.2 | `rzup install cargo-risczero r0vm` |
+| Docker (+ buildx) | 24+ | 用于交叉编译 guest ELF |
+| Boundless CLI | 0.3.0+ | `cargo install boundless-cli --locked` 或下载官方二进制 |
+| Node.js (可选) | 18+ | 仅前端开发需要 |
+| Nginx & Certbot (生产) | 最新 | 反向代理 + TLS |
 
-## 🚀 快速开始
+> **测试网依赖**：一个 Sepolia 钱包私钥 & 少量 ETH + HitPoints(HP) 代币用于支付费用。
 
-### 1. 环境准备
+---
 
-确保安装以下工具：
+## 环境准备
 ```bash
-# 安装Rust和Cargo
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+# 1. 安装 Rust
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+source $HOME/.cargo/env
 
-# 安装RISC Zero工具链
+# 2. 安装 RISC Zero 工具链
+curl -L https://github.com/risc0/risc0/releases/download/v2.2.0/installer.sh | bash
+rzup install cargo-risczero r0vm
+
+# 3. 安装 Docker (如未安装)
+# 参见 https://docs.docker.com/engine/install/ubuntu/
+
+# 4. 安装 Boundless CLI
+cargo install boundless-cli --locked
+
+# 5. Clone 项目
+git clone https://github.com/your_org/guess-number-game.git
+cd guess-number-game
+```
+
+### 手动安装步骤（Ubuntu 22.04）
+
+以下步骤逐条执行，完成所有依赖安装，可根据自身环境跳过已满足的部分。
+
+#### 1. 安装系统依赖
+```bash
+sudo apt update
+sudo apt install -y curl wget git build-essential make gcc \
+    pkg-config libssl-dev clang ninja-build lz4 jq tmux htop ncdu unzip \
+    libgbm1 libclang-dev libleveldb-dev automake autoconf bsdmainutils \
+    iptables nvme-cli tar ca-certificates gnupg
+```
+
+#### 2. 安装 Docker + buildx
+```bash
+sudo install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo tee /etc/apt/keyrings/docker.asc >/dev/null
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | \
+  sudo tee /etc/apt/sources.list.d/docker.list >/dev/null
+sudo apt update
+sudo apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin
+sudo systemctl enable --now docker
+```
+
+#### 3. 安装 Rust
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+source "$HOME/.cargo/env"
+rustup update
+```
+
+#### 4. 安装 RISC Zero 工具链
+```bash
 curl -L https://risczero.com/install | bash
-rzup
+source ~/.bashrc
+rzup install rust
+rzup install cargo-risczero
 ```
 
-### 2. 网络设置（服务器管理员配置）
-
-#### Sepolia测试网配置
-服务器管理员需要：
-1. 准备一个钱包地址用于服务器
-2. 获取测试ETH：https://faucets.chain.link/sepolia
-3. 获取HitPoints测试代币（Boundless质押代币）
-
-#### 重要合约地址 (Sepolia)
-- **Boundless Market**: `0x13337C76fE2d1750246B68781ecEe164643b98Ec`
-- **HitPoints代币**: `0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238`
-- **Verifier Router**: `0x925d8331ddc0a1F0d96E68CF073DFE1d92b69187`
-
-### 3. 环境变量配置
-
-复制环境变量模板：
+#### 5. （可选）安装 cargo-risczero
 ```bash
-cp example.env .env
+cargo install cargo-risczero --locked
 ```
 
-编辑`.env`文件：
+#### 6. 安装 Boundless CLI & Bento CLI
 ```bash
-# 钱包私钥（不要泄露！）
-PRIVATE_KEY=你的私钥
+cargo install --locked boundless-cli
+cargo install --locked --git https://github.com/risc0/risc0 bento-client --branch release-2.1 --bin bento_cli
+```
 
-# Sepolia RPC端点
+#### 7. （可选）安装 just
+```bash
+cargo install just
+echo 'export PATH="$HOME/.cargo/bin:$PATH"' >> ~/.bashrc
+source ~/.bashrc
+```
+
+#### 8. 版本检查
+```bash
+rustc --version && cargo --version
+rzup --version && r0vm --version
+docker --version && docker buildx version
+boundless --help
+```
+
+创建 `.env`：
+```bash
+cat > .env <<EOF
 RPC_URL=https://ethereum-sepolia-rpc.publicnode.com
-
-# 日志级别
+PRIVATE_KEY=0xYourPrivateKey
+PINATA_JWT=eyJhbGciOiJ...
 RUST_LOG=info
+EOF
 ```
 
-### 4. 手动存款准备（服务器启动前）
+---
 
-⚠️ **重要：服务器管理员需要在启动游戏服务器前手动存款到Boundless市场**
-
-#### 一次性存款操作
-
-1. **ETH存款** - 支付证明费用
-   ```bash
-   # 每次证明大约需要 0.001-0.002 ETH
-   # 建议存款足够多次游戏使用
-   # 需要直接调用Boundless Market合约的 deposit() 方法
-   ```
-
-2. **HitPoints代币存款** - 支付lock stake质押  
-   ```bash
-   # 每次请求需要质押约 0.001 HitPoints
-   # 建议存款足够多次游戏使用
-   # 先调用 HitPoints.approve(market_address, amount)
-   # 再调用 BoundlessMarket.depositStake(amount)
-   ```
-
-#### 管理员存款步骤
-
-**通过MetaMask或其他钱包界面：**
-
-1. **存入ETH**：
-   - 合约地址：`0x13337C76fE2d1750246B68781ecEe164643b98Ec`
-   - 调用方法：`deposit()` 
-   - 发送ETH：0.1 ETH (建议存足够多次游戏)
-
-2. **存入HitPoints质押**：
-   - 先授权：向 `0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238` 调用 `approve(0x13337C76fE2d1750246B68781ecEe164643b98Ec, 10000000)`
-   - 再存入：向 `0x13337C76fE2d1750246B68781ecEe164643b98Ec` 调用 `depositStake(10000000)`
-
-**获取HitPoints测试代币：**
-- 如果你有ETH，可以通过Uniswap等DEX交换
-- 或联系Boundless社区获取测试代币
-
-### 5. 构建和运行
-
+## 编译与运行
+### 1. 编译 guest (game-result)
 ```bash
-# 构建项目
-cargo build --release
-
-# 运行服务器
-./run.sh
-# 或者
-cargo run --bin apps
+# 生成 riscv ELF；Docker 自动触发 buildx
+cargo risczero build -p game-result
+# 生成文件: target/riscv32im-risc0-zkvm-elf/docker/game-result.bin
 ```
 
-访问 http://localhost:3030 开始游戏！
-
-## 🎮 游戏流程
-
-1. **打开游戏** - 访问游戏网址
-2. **开始游戏** - 点击"开始新游戏"按钮
-3. **等待证明** - zkVM生成随机数证明（约30秒-2分钟）
-4. **开始猜测** - 选择"更高"、"更低"或"相等"
-5. **查看结果** - 显示实际数字和游戏结果
-
-## 💰 费用说明
-
-### 服务器运营成本
-服务器管理员需要提前存款到Boundless市场：
-
-1. **ETH存款** - 支付证明费用
-   - 每次证明费用：~0.001-0.002 ETH
-   - 建议存款：0.1 ETH (可支持50+次游戏)
-   - 存款方法：调用市场合约的 `deposit()` 方法
-
-2. **HitPoints质押** - 支付锁定质押  
-   - 每次质押金额：~0.001 HitPoints
-   - 建议存款：10,000,000 wei (可支持多次游戏)
-   - 完成后会退还质押
-   - 存款方法：先 `approve()` 再 `depositStake()`
-
-### 用户使用成本
-- **免费游戏**: 用户无需支付任何费用
-- **测试网**: 服务器使用测试代币，无实际成本
-- **主网**: 服务器运营成本约每次游戏 0.002 ETH + gas费用
-
-## 🔧 开发模式
-
-如果没有足够的测试代币，可以启用开发模式：
-
+### 2. 编译 & 启动后端
 ```bash
-# 在apps/src/main.rs中取消注释开发模式代码
-// 使用本地随机数而不是Boundless证明
+cargo build -p apps --release
+# 运行 (使用 .env 环境变量)
+source .env
+./target/release/guess-number-app
+# 默认监听 0.0.0.0:3030
 ```
 
-## 📊 系统架构图
+### 3. 访问
+浏览器打开 `http://<服务器IP>:3030/` 即可开始游戏。
 
-```
-预先准备：服务器配置私钥和手动存款ETH和HitPoints到Boundless市场
+---
 
-用户 → Web界面 → 后端服务器 → Boundless市场 → 证明者网络
- ↓                                ↓              ↓
-开始游戏          创建证明请求      使用已存款      生成证明
- ↓                                ↓              ↓
-等待证明          提交请求         扣除费用        返回结果
-```
 
-## 🐛 常见问题
+---
 
-### Q: "需要设置PRIVATE_KEY环境变量"
-A: 确保.env文件中设置了正确的私钥（服务器管理员负责配置）
+## 常见问题
+| 现象 | 可能原因 / 解决办法 |
+|------|--------------------|
+| guest 构建报 `DeserializeUnexpectedEnd` | host/guest 编码方式不一致；确保 `--encode-input` 与 guest `env::read()` 搭配 |
+| `r0vm server incompatible` | 升级/降级 `r0vm` 与 `risc0-zkvm` 版本一致（均 2.2） |
+| Boundless CLI 报 *storage provider required* | 设置 `PINATA_JWT` 或改用 `RISC0_DEV_MODE=1` 本地文件存储 |
+| 请求价格过高 | 在 `apps/src/main.rs` 的 `spawn_cli_proof` 里通过 `--min-price / --max-price` 覆盖 |
+| 反向代理后 WebSocket 404 | Warp 无 WebSocket，本项目纯 HTTP；若自定义添加需在 Nginx 加 `proxy_http_version 1.1;` |
 
-### Q: "Insufficient balance to cover request"  
-A: 服务器管理员需要手动存入更多ETH到Boundless市场，调用市场合约的 `deposit()` 方法
+---
 
-### Q: 提交请求时出现质押相关错误
-A: 服务器管理员需要确保已手动存入足够的HitPoints质押，需要先 `approve()` 再 `depositStake()`
+## 参考链接
+* Boundless 文档：https://docs.beboundless.xyz
+* RISC Zero 开发文档：https://dev.risczero.com
+* Let’s Encrypt Certbot：https://certbot.eff.org
 
-### Q: 如何检查Boundless市场中的余额？
-A: 服务器管理员可以调用市场合约的 `balanceOf(服务器地址)` 和 `balanceOfStake(服务器地址)` 方法
+---
 
-### Q: 证明生成时间很长
-A: Boundless网络负载可能较高，通常1-5分钟内完成
-
-### Q: 游戏状态一直显示"requesting_proof"
-A: 检查网络连接和Boundless服务状态，或检查是否有足够的存款余额（服务器管理员负责）
-
-## 📝 相关资源
-
-- [Boundless文档](https://docs.beboundless.xyz)
-- [RISC Zero文档](https://dev.risczero.com)
-- [Sepolia测试网水龙头](https://faucets.chain.link/sepolia)
-- [MetaMask设置指南](https://metamask.io/download/)
-
-## 📝 许可证
-
-MIT License - 详见 [LICENSE](LICENSE) 文件 
+> 本项目基于 MIT 许可证发布。 

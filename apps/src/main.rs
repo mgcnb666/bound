@@ -6,16 +6,16 @@ use std::{
 
 use anyhow::Result;
 use rand::Rng;
-use risc0_zkvm::sha::Digest;
 use serde::{Deserialize, Serialize};
 use tracing_subscriber::{filter::LevelFilter, prelude::*, EnvFilter};
 use warp::{Filter, Reply};
 
 use tokio::process::Command;
 use std::fs;
+use std::path::PathBuf;
+use std::str::FromStr;
 
 // 引入guest程序
-risc0_zkvm::include_image!(pub GAME_RESULT_ID, GAME_RESULT_ELF, "game_result");
 
 // 游戏状态结构
 #[derive(Debug, Clone, Serialize)]
@@ -120,7 +120,7 @@ async fn main() -> Result<()> {
 
     println!("🎲 猜数字游戏服务器启动在 http://localhost:3030");
     warp::serve(routes)
-        .run(([127, 0, 0, 1], 3030))
+        .run(([0, 0, 0, 0], 3030))
         .await;
 
     Ok(())
@@ -266,37 +266,49 @@ async fn spawn_cli_proof(random_number: u32, guess: u32, won: bool) -> Result<()
         }
     };
 
-    // 将 guest ELF 写入临时文件
+    // 找到编译好的 ELF 路径 (release, riscv target)
+    let mut elf_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    // 使用 cargo risczero build 导出的 bin 文件
+    elf_path.push("../target/riscv32im-risc0-zkvm-elf/docker/game-result.bin");
+
+    if !elf_path.exists() {
+        tracing::error!("找不到 game-result ELF，请先执行 'cargo build --release --target riscv32im-risc0_zkvm-elf'");
+        return Ok(());
+    }
+
+    let elf_bytes = fs::read(&elf_path)?;
+
+    // 将 ELF 拷贝到临时文件，供 CLI 使用
     let mut program_path = std::env::temp_dir();
     program_path.push(format!("game_result_{}.elf", current_timestamp()));
-    fs::write(&program_path, GAME_RESULT_ELF)?;
+    fs::write(&program_path, &elf_bytes)?;
 
-    // 构造最简 YAML（仅占位，让 CLI 接收 --program 覆盖 imageUrl）
-    let mut yaml_path = std::env::temp_dir();
-    yaml_path.push(format!("request_{}.yaml", current_timestamp()));
-
-    let image_id_hex = hex::encode(GAME_RESULT_ID.as_bytes());
     // 构造输入 bytes: random_number(u32 LE) | guess(u32 LE) | won(u8)
     let mut input_bytes = Vec::with_capacity(9);
     input_bytes.extend(&random_number.to_le_bytes());
     input_bytes.extend(&guess.to_le_bytes());
     input_bytes.push(if won { 1 } else { 0 });
 
-    let input_hex = hex::encode(&input_bytes);
+    // 写入临时文件，供 CLI 作为 --input-file 使用
+    let mut input_path = std::env::temp_dir();
+    input_path.push(format!("input_{}.bin", current_timestamp()));
+    fs::write(&input_path, &input_bytes)?;
 
-    let yaml_content = format!(
-        "id: 0\nrequirements:\n  imageId: \"{image_id}\"\n  predicate:\n    predicateType: Always\n    data: \"\"\nimageUrl: \"\"\ninput:\n  inputType: Inline\n  data: \"{input_hex}\"\noffer:\n  minPrice: 100000000000000\n  maxPrice: 2000000000000000\n  biddingStart: 0\n  rampUpPeriod: 300\n  timeout: 3600\n  lockTimeout: 2700\n  lockStake: 1000000\n",
-        image_id = image_id_hex,
-        input_hex = input_hex
-    );
-    fs::write(&yaml_path, yaml_content)?;
-
-    // 组装 CLI 命令
+    // 组装 CLI 命令：使用 submit-offer 子命令，并通过本地文件提供 program 与 input
     let mut cmd = Command::new("boundless");
     cmd.arg("--rpc-url").arg(&rpc_url);
     cmd.arg("--private-key").arg(&private_key);
-    cmd.args(["request", "submit", yaml_path.to_string_lossy().as_ref()]);
-    cmd.args(["--program", program_path.to_string_lossy().as_ref()]);
+
+    cmd.args([
+        "request",
+        "submit-offer",
+        "--program",
+        program_path.to_string_lossy().as_ref(),
+        "--input-file",
+        input_path.to_string_lossy().as_ref(),
+        "--encode-input",
+        // 如无明确定价需求，使用 CLI 内部默认报价
+    ]);
 
     // 后台运行，不等待结果
     cmd.spawn()?;
