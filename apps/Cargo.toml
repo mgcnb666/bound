@@ -1,0 +1,19 @@
+[package]
+name = "guess-number-app"
+version = "0.1.0"
+edition = "2021"
+
+[build-dependencies]
+risc0-build = { version = "1.1" }
+
+[dependencies]
+anyhow = { workspace = true }
+rand = "0.8"
+hex = "0.4"
+risc0-zkvm = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+warp = "0.3"
+serde_json = "1.0" 
